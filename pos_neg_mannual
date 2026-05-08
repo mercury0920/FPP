@@ -1,0 +1,151 @@
+#人工增强
+import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import numpy as np
+import os
+import re
+import time
+import matplotlib.pyplot as plt
+import h5py
+import scipy.io as sio
+import torch.multiprocessing as mp
+
+
+
+# ---------- 路径 ----------
+DATA_PATHS = {
+    'train': '/opt/dpcvol/datasets/3232118373221765150/成万20251114_CFR/train_CFR'
+}
+COORD_FILES = {
+    'train': ('ue_loc_interp.mat', 'ue_loc_interp')
+}
+SAVE_DIR = '/opt/dpcvol/datasets/3232118373221765150/成万20251114_CFR/train_CFR_pos_samples_augmented'
+os.makedirs(SAVE_DIR, exist_ok=True)
+# ---------- 工具 ----------
+def load_mat_file(file_path, key):
+    try:
+        with h5py.File(file_path, 'r') as f:
+            return f[key][:]
+    except (OSError, KeyError):
+        try:
+            return sio.loadmat(file_path)[key]
+        except (OSError, KeyError) as e:
+            print(f'[WARN] load {file_path} failed: {e}')
+            return None
+
+def load_cfr_feature(path, key='CFRImg'):
+    return load_mat_file(path, key)
+
+def load_dataset_paths(ds_key):
+    data_path = DATA_PATHS[ds_key]
+    coord_file, coord_key = COORD_FILES[ds_key]
+    coord_path = os.path.join(data_path, coord_file)
+    coords = load_mat_file(coord_path, coord_key)
+    if coords is not None and coords.shape[0] == 2:
+        coords = coords.T
+    cfr_files = sorted(
+        [f for f in os.listdir(data_path) if f.startswith('CFR') and f.endswith('.mat')],
+        key=lambda x: int(re.search(r'\d+', x).group())
+    )
+    cfr_paths = [os.path.join(data_path, f) for f in cfr_files]
+    print(f'[INFO] {ds_key}: {len(coords)} coords, {len(cfr_paths)} CFR files')
+    return coords, cfr_paths
+
+# ---------- 数据增强 ----------
+def add_random_noise(feat, noise_level=0.05):
+    return feat + np.random.normal(0, noise_level, feat.shape)
+
+def subcarrier_dropout(feat, dropout_prob=0.1):
+    mask = np.random.binomial(1, 1 - dropout_prob, size=feat.shape[1])
+    return feat * mask
+
+def phase_rotation(feat, max_frac=1/12):
+    rotation = np.random.uniform(-max_frac, max_frac)
+    feat[116:, :] = (feat[116:, :] + rotation) % 1.0
+    return feat
+
+def rru_dropout(feat, dropout_prob=0.1):
+    num_rrus, num_ants = 29, 4
+    mask = np.random.binomial(1, 1 - dropout_prob, size=num_rrus)
+    for i in range(num_rrus):
+        if mask[i] == 0:
+            feat[num_ants*i:num_ants*(i+1), :] = 0
+            feat[116+num_ants*i:116+num_ants*(i+1), :] = 0
+    return feat
+
+def apply_augmentations(feat, prob=0.3):
+    augs = [add_random_noise, subcarrier_dropout, phase_rotation, rru_dropout]
+    np.random.shuffle(augs)
+    for aug in augs:
+        if np.random.rand() < prob:
+            feat = aug(feat)
+    return feat
+
+# ---------- 主流程 ----------
+def extract_positive_samples(coords, cfr_paths, select_ratio=1):
+    num_select = int(select_ratio * len(coords))
+    sel_idx = np.random.choice(len(coords), num_select, replace=False)
+    samples, coord_list = [], []
+    for cnt, i in enumerate(sel_idx):
+        if cnt % 1000 == 0:
+            print(f'[INFO] processing {cnt}/{num_select}')
+        coord = coords[i]
+        feat = load_cfr_feature(cfr_paths[i])
+        if feat is None:
+            continue
+        aug_feat = apply_augmentations(feat.copy())
+        samples.append({'original': feat, 'augmented': aug_feat})
+        coord_list.append(coord)
+    print(f'[INFO] valid samples: {len(samples)}')
+    return samples, coord_list
+
+
+def save_all(samples):
+    save_path = os.path.join(SAVE_DIR, 'positive_samples.pth')
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    torch.save(samples, save_path)
+    print(f'[INFO] Saved {len(samples)} samples to {save_path}')
+    print(f'[INFO] File size: {os.path.getsize(save_path) / 1024 / 1024:.2f} MB')    
+'''
+def save_all(samples, coord_list):
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    # 样本
+    torch.save(samples, os.path.join(SAVE_DIR, 'positive_samples.pth'))
+    # 坐标
+    np.save(os.path.join(SAVE_DIR, 'positive_coords_train_original.npy'), np.array(coord_list))
+    np.save(os.path.join(SAVE_DIR, 'positive_coords_train_augmented.npy'), np.array(coord_list))
+    print('[INFO] all saved to', SAVE_DIR)
+
+def plot_coords(coord_list):
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # 无头
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 6))
+        coords = np.array(coord_list)
+        plt.scatter(coords[:, 0], coords[:, 1], s=10)
+        plt.title('Positive Sample Coords')
+        plt.savefig(os.path.join(SAVE_DIR, 'positive_sample_coords.png'))
+        print('[INFO] coords png saved')
+    except Exception as e:
+        print('[WARN] plot failed:', e)
+'''
+def main():
+    print('[START]  positive sample extraction')
+    coords, cfr_paths = load_dataset_paths('train')
+    samples, coord_list = extract_positive_samples(coords, cfr_paths)
+    #save_all(samples, coord_list)
+    save_all(samples)
+    #plot_coords(coord_list)
+    print('[END] all done')
+
+if __name__ == '__main__':
+    main()
