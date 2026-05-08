@@ -1,0 +1,210 @@
+#以四天线工业网关20240814为基础集，在四天线工业网关20240829中寻找正样本
+#增加正样本坐标可视化部分
+import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import numpy as np
+import os
+import re
+import time
+import matplotlib.pyplot as plt
+import h5py
+import scipy.io as sio
+import torch.multiprocessing as mp
+
+# 数据路径
+DATA_PATHS = {
+    '20240814': '/opt/dpcvol/datasets/8329555769475161281/四天线工业网关20240814',
+    '20240829': '/opt/dpcvol/datasets/8329555769475161281/四天线工业网关20240829'
+}
+# 坐标文件与键名
+COORD_FILES = {
+    '20240814': ('gt.mat', 'ue_loc_interp'),
+    '20240829': ('gt.mat', 'gt')
+}
+
+# 加载.mat文件函数
+def load_mat_file(file_path, key):
+    try:
+        with h5py.File(file_path, 'r') as file:
+            data = file[key][:]
+            return data
+    except (OSError, KeyError):
+        try:
+            mat_file = sio.loadmat(file_path)
+            data = mat_file[key]
+            return data
+        except (OSError, KeyError) as e:
+            print(f"Failed to load file {file_path}: {e}")
+            return None
+
+# 加载数据集的坐标和特征文件路径
+def load_dataset_paths(dataset_key):
+    data_path = DATA_PATHS[dataset_key]
+    coord_file, coord_key = COORD_FILES[dataset_key]
+    coord_path = os.path.join(data_path, coord_file)
+    print(f"\nLoading coordinates from: {coord_path}")
+    coords = load_mat_file(coord_path, coord_key)
+    if coords is not None and coords.shape[0] == 2:
+        coords = coords.T
+        print("Transposed coordinates. New shape:", coords.shape)
+    
+    cfr_files = sorted([f for f in os.listdir(data_path) if f.startswith('CFR') and f.endswith('.mat')], key=lambda x: int(re.search(r'\d+', x).group()))
+    print(f"Found {len(cfr_files)} CFR files in {data_path}")
+    cfr_paths = [os.path.join(data_path, cfr_file) for cfr_file in cfr_files]
+    
+    print(f"Loaded dataset {dataset_key} with {len(coords)} coordinates and {len(cfr_paths)} feature files")
+    return coords, cfr_paths
+
+# 加载特征文件
+def load_cfr_feature(file_path, key='CFRImg'):
+    return load_mat_file(file_path, key)
+
+# 提取正样本并记录坐标
+def extract_positive_samples(base_coords, base_cfr_paths, other_data, distance_threshold=0.25):
+    start_time = time.time()
+    print("\nStarting to extract positive samples...")
+    
+    positive_samples = []
+    positive_indices = {key: [] for key in other_data.keys()}
+    # 记录正样本的坐标
+    positive_coords = {
+        '20240814': [],
+        '20240829': []
+    }  
+    
+    valid_count = 0
+    
+    #以 20240814 为基准，对每条轨迹点在所有其他数据集里找最近邻，距离<0.25 m 就算正样本。
+    for i in range(len(base_coords)):
+        if i % 1000 == 0:
+            elapsed_time = time.time() - start_time
+            print(f"Processing base sample {i + 1}/{len(base_coords)}. Elapsed time: {elapsed_time:.2f} seconds")
+        
+        base_coord = base_coords[i]
+        base_feature_path = base_cfr_paths[i]
+        base_feature = load_cfr_feature(base_feature_path)
+        
+        all_valid = True
+        pos_sample = {'base': base_feature}
+        
+        for dataset_key in other_data:
+            coords, cfr_paths = other_data[dataset_key]
+            if len(coords) == 0 or len(cfr_paths) == 0:
+                print(f"No data available for dataset {dataset_key}. Skipping.")
+                all_valid = False
+                break
+                
+            distances = np.linalg.norm(coords - base_coord, axis=1)
+            min_idx = np.argmin(distances) if len(distances) > 0 else 0
+            min_distance = distances[min_idx]
+            
+            print(f"Nearest neighbor in dataset {dataset_key}: Distance={min_distance:.4f}m, Index={min_idx}")
+            
+            if min_distance > distance_threshold:
+                print(f"Distance {min_distance:.4f}m exceeds threshold {distance_threshold:.2f}m. Sample discarded.")
+                all_valid = False
+                break
+                
+            cfr_path = cfr_paths[min_idx]
+            cfr_feature = load_cfr_feature(cfr_path)
+            pos_sample[dataset_key] = cfr_feature
+            positive_indices[dataset_key].append(min_idx)
+            positive_coords[dataset_key].append(coords[min_idx])  # 记录对应数据集的坐标
+        
+        if all_valid:
+            positive_samples.append(pos_sample)
+            positive_coords['20240814'].append(base_coord)  # 记录基数据集的坐标
+            valid_count += 1
+            print(f"Valid sample {valid_count} saved.")
+    
+    for dataset_key in other_data:
+        count = len(positive_indices[dataset_key])
+        print(f"Dataset {dataset_key}: {count} samples selected as positive samples")
+    
+    print(f"\nFinished extracting positive samples. Total time: {time.time() - start_time:.2f} seconds")
+    print(f"Total valid samples saved: {len(positive_samples)}")
+    return positive_samples, positive_indices, positive_coords
+
+# 保存正样本
+def save_positive_samples(positive_samples):
+    save_dir = '/opt/dpcvol/datasets/8329555769475161281/1_pos_samples_original'
+    os.makedirs(save_dir, exist_ok=True)
+    
+    pos_path = os.path.join(save_dir, 'positive_samples.pth')
+    print(f"\nSaving positive samples ({len(positive_samples)} samples) to {pos_path}")
+    torch.save(positive_samples, pos_path)
+
+# 保存正样本坐标
+def save_positive_coords(positive_coords):
+    save_dir = '/opt/dpcvol/datasets/8329555769475161281/1_pos_samples_original'
+    os.makedirs(save_dir, exist_ok=True)
+    
+    for dataset_key in positive_coords:
+        coords_path = os.path.join(save_dir, f'positive_coords_{dataset_key}.npy')
+        np.save(coords_path, np.array(positive_coords[dataset_key]))
+        print(f"Saved positive coordinates for {dataset_key} to {coords_path}")
+
+# 可视化正样本坐标
+def plot_positive_sample_coords(positive_coords):
+    plt.figure(figsize=(10, 6))
+    
+    # 绘制基数据集（20240814）的正样本坐标
+    coords_20240814 = np.array(positive_coords['20240814'])
+    if len(coords_20240814) > 0:
+        plt.scatter(coords_20240814[:, 0], coords_20240814[:, 1], c='blue', label='20240814 (Base)', alpha=0.6, s=30, marker='o')
+        
+    # 绘制 20240829 数据集的正样本坐标
+    coords_20240829 = np.array(positive_coords['20240829'])
+    if len(coords_20240829) > 0:
+        plt.scatter(coords_20240829[:, 0], coords_20240829[:, 1], c='green', label='20240829 (Four Antennas)', alpha=0.4, s=30, marker='s')
+    
+    plt.xlabel('X Coordinate (m)')
+    plt.ylabel('Y Coordinate (m)')
+    plt.title('Positive Sample Coordinates from Datasets')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('/opt/dpcvol/datasets/8329555769475161281/1_pos_samples_original/positive_sample_coords.png')
+    print("Saved positive sample coordinates plot to /opt/dpcvol/datasets/8329555769475161281/1_pos_samples_original/positive_sample_coords.png")
+
+
+def extract_samples():
+    print("\nStarting sample extraction process...")
+    
+    # 加载数据集
+    print("Loading datasets...")
+    dataset_keys = ['20240814', '20240829']
+    all_data = {}
+    for key in dataset_keys:
+        coords, cfr_paths = load_dataset_paths(key)
+        all_data[key] = (coords, cfr_paths)
+    
+    # 提取正样本
+    print("Extracting positive samples with distance threshold...")
+    base_key = '20240814'
+    base_coords, base_cfr_paths = all_data[base_key]
+    other_keys = [ '20240829']
+    other_data = {key: all_data[key] for key in other_keys}
+    positive_samples, positive_indices, positive_coords = extract_positive_samples(base_coords, base_cfr_paths, other_data, distance_threshold=0.25)
+    
+    # 保存正样本
+    print("Saving positive samples...")
+    save_positive_samples(positive_samples)
+    
+    # 保存正样本坐标
+    print("Saving positive coordinates...")
+    save_positive_coords(positive_coords)
+    
+    # 可视化正样本坐标
+    print("Plotting positive sample coordinates...")
+    plot_positive_sample_coords(positive_coords)
+
+if __name__ == '__main__':
+    extract_samples()
